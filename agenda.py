@@ -1,23 +1,110 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-import json
-import os
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# Configuración de la página
-st.set_page_config(page_title="Sistema de Agendamiento de Citas", layout="wide")
+# Configuración de credenciales de Google Sheets
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+SPREADSHEET_ID = '1nlsu-q7RTwYkVH8oiGUCA7ij2ZCA14i2YMZWLZYfHps'
+RANGE_NAME = 'Hoja 1!A:E'
 
-# Inicialización del estado de la aplicación
-if 'citas' not in st.session_state:
-    if os.path.exists('citas.json'):
-        with open('citas.json', 'r') as f:
-            st.session_state.citas = json.load(f)
-    else:
-        st.session_state.citas = []
+@st.cache_resource
+def get_google_sheets_service():
+    credentials = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=SCOPES
+    )
+    service = build('sheets', 'v4', credentials=credentials)
+    return service
 
-def guardar_citas():
-    with open('citas.json', 'w') as f:
-        json.dump(st.session_state.citas, f)
+def read_google_sheets():
+    try:
+        service = get_google_sheets_service()
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=RANGE_NAME
+        ).execute()
+        values = result.get('values', [])
+        
+        if not values:
+            return []
+            
+        # Convertir a DataFrame y luego a lista de diccionarios
+        df = pd.DataFrame(values[1:], columns=values[0])
+        return df.to_dict('records')
+    except HttpError as err:
+        st.error(f"Error al leer Google Sheets: {err}")
+        return []
+
+def write_to_google_sheets(cita):
+    try:
+        service = get_google_sheets_service()
+        sheet = service.spreadsheets()
+        
+        values = [[
+            cita['id'],
+            cita['nombre'],
+            cita['email'],
+            cita['fecha_hora'],
+            cita['motivo']
+        ]]
+        
+        body = {
+            'values': values
+        }
+        
+        result = sheet.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=RANGE_NAME,
+            valueInputOption='RAW',
+            body=body
+        ).execute()
+        
+        return True
+    except HttpError as err:
+        st.error(f"Error al escribir en Google Sheets: {err}")
+        return False
+
+def delete_from_google_sheets(index):
+    try:
+        service = get_google_sheets_service()
+        sheet = service.spreadsheets()
+        
+        # Leer datos actuales
+        result = sheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=RANGE_NAME
+        ).execute()
+        values = result.get('values', [])
+        
+        # Eliminar la fila correspondiente
+        if len(values) > index + 1:  # +1 por la fila de encabezados
+            values.pop(index + 1)
+            
+            # Limpiar todo el rango y escribir los nuevos valores
+            sheet.values().clear(
+                spreadsheetId=SPREADSHEET_ID,
+                range=RANGE_NAME
+            ).execute()
+            
+            body = {
+                'values': values
+            }
+            
+            sheet.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=RANGE_NAME,
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+            
+            return True
+    except HttpError as err:
+        st.error(f"Error al eliminar de Google Sheets: {err}")
+        return False
 
 def main():
     st.title("📅 Sistema de Agendamiento de Citas")
@@ -38,6 +125,9 @@ def main():
 def agendar_cita():
     st.header("Agendar Nueva Cita")
     
+    # Obtener citas existentes
+    citas = read_google_sheets()
+    
     # Formulario para nueva cita
     with st.form("nueva_cita"):
         nombre = st.text_input("Nombre completo")
@@ -54,7 +144,7 @@ def agendar_cita():
         horas_disponibles = [
             f"{h:02d}:00" for h in range(9, 18)
             if f"{fecha.isoformat()} {h:02d}:00" not in [
-                cita['fecha_hora'] for cita in st.session_state.citas
+                cita['fecha_hora'] for cita in citas
             ]
         ]
         
@@ -67,16 +157,17 @@ def agendar_cita():
             if st.form_submit_button("Agendar Cita"):
                 if nombre and email and motivo:
                     nueva_cita = {
-                        "id": len(st.session_state.citas),
+                        "id": str(len(citas) + 1),
                         "nombre": nombre,
                         "email": email,
                         "fecha_hora": fecha_hora,
                         "motivo": motivo
                     }
                     
-                    st.session_state.citas.append(nueva_cita)
-                    guardar_citas()
-                    st.success("¡Cita agendada con éxito!")
+                    if write_to_google_sheets(nueva_cita):
+                        st.success("¡Cita agendada con éxito!")
+                    else:
+                        st.error("Error al agendar la cita")
                 else:
                     st.error("Por favor complete todos los campos")
         else:
@@ -85,8 +176,9 @@ def agendar_cita():
 def ver_citas():
     st.header("Citas Agendadas")
     
-    if st.session_state.citas:
-        df = pd.DataFrame(st.session_state.citas)
+    citas = read_google_sheets()
+    if citas:
+        df = pd.DataFrame(citas)
         st.dataframe(df)
     else:
         st.info("No hay citas agendadas")
@@ -94,10 +186,11 @@ def ver_citas():
 def cancelar_cita():
     st.header("Cancelar Cita")
     
-    if st.session_state.citas:
+    citas = read_google_sheets()
+    if citas:
         citas_dict = {
             f"{cita['nombre']} - {cita['fecha_hora']}": i 
-            for i, cita in enumerate(st.session_state.citas)
+            for i, cita in enumerate(citas)
         }
         
         cita_seleccionada = st.selectbox(
@@ -107,9 +200,10 @@ def cancelar_cita():
         
         if st.button("Cancelar Cita"):
             indice = citas_dict[cita_seleccionada]
-            st.session_state.citas.pop(indice)
-            guardar_citas()
-            st.success("Cita cancelada con éxito")
+            if delete_from_google_sheets(indice):
+                st.success("Cita cancelada con éxito")
+            else:
+                st.error("Error al cancelar la cita")
     else:
         st.info("No hay citas para cancelar")
 
